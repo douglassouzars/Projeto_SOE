@@ -58,6 +58,7 @@ JANELA_REF_S = 30.0              # referência "em pé" = áreas compactas dos �
 PERCENTIL_REF = 20               # usa as MENORES (em pé < sentado < agachado)
 TAXA_APRENDIZADO = 0.0005        # em IDLE: fundo se adapta devagar (luz, objetos)
 AREA_MIN = 0.004                 # mancha < 0,4% do quadro = ruído, ignora (calibrar no teto)
+VAR_MIN_FUNDO = 60               # variância mínima do fundo (desvio ~8 níveis)
                                  # (teste2: manchas de ruído com 0,5-1,9%; pessoa
                                  #  deitada no canto oposto ~8%)
 QUADRO_CORROMPIDO = 0.5          # >50% dos pixels mudando de um quadro p/ outro
@@ -65,6 +66,9 @@ QUADRO_CORROMPIDO = 0.5          # >50% dos pixels mudando de um quadro p/ outro
 
 ALONG_EM_PE = 2.0                # alongamento <= 2,0 -> "em pé" (mancha redonda)
 ALONG_DEITADO = 2.6              # alongamento >= 2,6 -> "deitado" (histerese)
+ALONG_DEITADO_CORTADO = 1.7      # idem p/ corpo cortado pela borda (só queda lenta)
+AREA_CORTADO_MIN = 0.15          # ...e só se a mancha for grande (pessoa, não ruído)
+ALONG_RECUPERA = 2.3             # levantou = 3 s seguidos com alongamento <= 2,3
 RAZAO_AREA_DEITADO = 0.5         # deitado ocupa >= metade da área em pé
 # Calibração (teste real, 17/11): deitado = alongamento 3,3–3,7 mas ÁREA
 # PARECIDA com a de pé (1,0–1,3x). Motivo: perspectiva. Em pé, cabeça e
@@ -76,6 +80,13 @@ RAZAO_AREA_DEITADO = 0.5         # deitado ocupa >= metade da área em pé
 JANELA_QUEDA_S = 1.5             # em pé -> deitado em até 1,5 s = QUEDA
                                  # (deitar-se devagar leva mais tempo)
 CONFIRMA_S = 0.5                 # precisa PERMANECER deitado 0,5 s p/ confirmar
+QUEDA_LENTA_S = 20.0            # deitado no chão por 20 s seguidos = queda LENTA
+                                # (tontura: a pessoa cede aos poucos; não depende
+                                #  da velocidade). Câmera NÃO pode ver cama/sofá.
+TOLERANCIA_CHAO_S = 2.0         # oscilação curta da forma não zera a contagem
+JANELA_LENTA_S = 30.0           # em pé no máximo 30 s antes de ir ao chão
+FRACAO_CHAO = 0.7                # queda lenta: >=70% dos quadros com forma deitada
+EM_PE_MIN_S = 1.0               # forma compacta por >= 1 s = estava em pé
 TEMPO_CRITICO_S = 60.0           # 60 s no chão -> queda GRAVE
 TEMPO_RECUPERACAO_S = 3.0        # em pé por 3 s seguidos -> levantou
 COOLDOWN_ALERTA_S = 300.0        # intervalo mínimo entre alertas graves
@@ -109,7 +120,8 @@ class Medida:
 class Silhueta:
     """Subtração de fundo + análise da maior mancha."""
 
-    def __init__(self):
+    def __init__(self, compensar=True):
+        self.compensar = compensar      # False com --exposicao (câmera fixa)
         self.total_descartados = 0      # contadores do teste inteiro
         self.total_quadros = 0
         self.reinicia()
@@ -118,6 +130,12 @@ class Silhueta:
     def reinicia(self):
         self.fundo = cv2.createBackgroundSubtractorMOG2(
             history=500, varThreshold=32, detectShadows=True)
+        # Variância mínima do fundo: aprendido com a cena totalmente parada, o
+        # modelo fica com variância quase zero e QUALQUER variação global de
+        # brilho (luz do dia mudando, ajuste da câmera) marca o chão inteiro
+        # como pessoa (cam_brio4: o chão escureceu ~6% e a máscara ficou
+        # toda branca). Com este piso, pequenas variações são toleradas.
+        self.fundo.setVarMin(VAR_MIN_FUNDO)
         self.cinza_ant = None
         self.mascara_ant = None
         self.ganho = 1.0
@@ -129,8 +147,8 @@ class Silhueta:
         cena. Aqui o quadro é reescalado para que o FUNDO (pixels fora da
         última máscara) tenha o mesmo brilho do fundo aprendido. Assim a
         variação global não vira 'pessoa' na máscara, sem mexer na câmera."""
-        if taxa == -1 or self.mascara_ant is None:      # ainda aprendendo
-            return peq
+        if taxa == -1 or self.mascara_ant is None or not self.compensar:
+            return peq          # aprendendo, ou exposição manual (desnecessária)
         fundo_img = self.fundo.getBackgroundImage()
         if fundo_img is None:
             return peq
@@ -222,7 +240,12 @@ class FSM:
         self.estado = Estado.IDLE
         self.area_ref = None      # área típica da pessoa EM PÉ (aprendida)
         self.compactas = []       # (t, área) de manchas compactas recentes
-        self.t_em_pe = None       # último instante em pé
+        self.t_em_pe = None       # último instante em pé (sustentado)
+        self.t_compacto_ini = None  # início da sequência contínua compacta
+        self.t_chao_ini = None    # início da permanência deitado no chão
+        self.n_chao = self.n_total = 0   # quadros no chão / total desde t_chao_ini
+        self.t_ultimo_deitado = None
+        self.tipo_queda = None
         self.t_deitado_ini = None # início da sequência contínua "deitado"
         self.t_erguido = None     # início da sequência contínua "em pé"
         self.t_queda = None
@@ -255,8 +278,13 @@ class FSM:
         self.t_ultima_det = t
         em_pe, deitado = self.classifica(m)
 
-        if em_pe:
+        # "Em pé" para fins de queda exige a forma compacta SUSTENTADA por
+        # EM_PE_MIN_S. Rolar no chão passa por formas compactas por instantes
+        # (cam_brio3, 32 s) e não pode contar como "estava em pé".
+        self.t_compacto_ini = (self.t_compacto_ini or t) if em_pe else None
+        if em_pe and t - self.t_compacto_ini >= EM_PE_MIN_S:
             self.t_em_pe = t
+        if em_pe:
             if self.estado == Estado.IDLE and not m.borda:
                 # Referência "em pé" (só com a pessoa INTEIRA: um pedaço do
                 # corpo na borda, como uma mão, não serve): vista de cima, em pé, sentado e agachado
@@ -272,10 +300,20 @@ class FSM:
         # seguidos "em pé" (alongamento <= 2,0), mas o alongamento oscila
         # entre 1,7 e 2,2 de um quadro para outro e zerava a contagem: o
         # sistema ficava preso em ALERTA (bug visto no teste de 17/11).
-        if deitado:
-            self.t_erguido = None
-        else:
+        # Ajuste (teste cam_brio3, 19/11): deitado de bruços o alongamento caiu
+        # para 2,4-2,5 (entre os dois limites), contou como "não deitado" e o
+        # alarme foi encerrado com a pessoa ainda no chão. Agora a contagem
+        # só corre com alongamento <= ALONG_RECUPERA (em pé mede 1,1-2,2).
+        # Corpo deitado CORTADO pela borda (pernas fora da imagem) tem o
+        # alongamento subestimado (cam_brio6: 1,9 em vez de >2,6). Conta
+        # como "no chão" se for grande (pessoa perto da lente, não ruído
+        # nem gato) e alongado acima de ALONG_DEITADO_CORTADO.
+        cortado_no_chao = (m.cortada and m.along >= ALONG_DEITADO_CORTADO
+                           and m.area >= AREA_CORTADO_MIN)
+        if m.along <= ALONG_RECUPERA and not cortado_no_chao:
             self.t_erguido = self.t_erguido or t
+        else:
+            self.t_erguido = None
 
         # Para INICIAR uma queda, a mancha deitada não pode estar CORTADA pela
         # borda (encostar com um pé tudo bem): cortada, a forma não é confiável (teste3, 37 s: pessoa
@@ -283,6 +321,24 @@ class FSM:
         # gerou alarme falso). Durante o monitoramento a borda não importa.
         self.t_deitado_ini = ((self.t_deitado_ini or t)
                               if deitado and not m.cortada else None)
+        # Permanência no chão (queda lenta): tolera oscilações curtas.
+        no_chao = (deitado and not m.cortada) or cortado_no_chao
+        if no_chao:
+            if self.t_chao_ini is None:
+                self.t_chao_ini = t
+                self.n_chao = self.n_total = 0
+            self.t_ultimo_deitado = t
+        elif (self.t_ultimo_deitado is None
+              or t - self.t_ultimo_deitado > TOLERANCIA_CHAO_S):
+            self.t_chao_ini = None
+        # Ficou EM PÉ (forma compacta sustentada) depois de "deitar": não é
+        # permanência no chão. Sem isso, manchas cortadas e ruidosas de quem
+        # anda perto da lente mantinham a contagem viva (teste2, 42-51 s).
+        if self.t_em_pe == t and not no_chao:
+            self.t_chao_ini = None
+        if self.t_chao_ini is not None:   # fração dos quadros realmente "no chão"
+            self.n_total += 1
+            self.n_chao += no_chao
         levantou = self.t_erguido is not None and t - self.t_erguido >= TEMPO_RECUPERACAO_S
 
         if self.estado == Estado.IDLE:
@@ -293,7 +349,25 @@ class FSM:
                 if self.transicao_s <= JANELA_QUEDA_S:     # rápido = queda
                     self.estado = Estado.MONITORANDO
                     self.t_queda = t
+                    self.tipo_queda = "rapida"
                     self.movs = []
+            # Queda LENTA: deitado no chão tempo demais, qualquer que tenha
+            # sido a descida. O tempo no chão conta desde que deitou.
+            # Exige uma PESSOA vista em pé pouco antes de ir ao chão (evita que
+            # ruído ou objetos numa cena vazia virem "queda lenta").
+            pessoa_antes = (self.t_em_pe is not None and
+                            self.t_chao_ini is not None and
+                            self.t_chao_ini - self.t_em_pe <= JANELA_LENTA_S)
+            # E exige a forma deitada na MAIORIA dos quadros (não só picos
+            # isolados de uma mancha ruidosa de quem está em pé).
+            if (self.estado == Estado.IDLE and pessoa_antes
+                    and t - self.t_chao_ini >= QUEDA_LENTA_S
+                    and self.n_chao >= FRACAO_CHAO * self.n_total):
+                self.estado = Estado.MONITORANDO
+                self.t_queda = self.t_chao_ini
+                self.tipo_queda = "lenta"
+                self.transicao_s = 0.0
+                self.movs = []
 
         elif self.estado == Estado.MONITORANDO:
             self.movs.append(m.movimento)
@@ -320,13 +394,16 @@ class FSM:
 
     def _info(self, t):
         mov = float(np.mean(self.movs)) if self.movs else 0.0
-        return {"transicao_s": round(self.transicao_s, 2),
+        return {"tipo": self.tipo_queda or "-",
+                "transicao_s": round(self.transicao_s, 2),
                 "tempo_no_chao_s": round(t - self.t_queda, 1),
                 "imovel": mov < LIMIAR_IMOVEL,
                 "movimento": round(mov, 3)}
 
     def _zera(self):
         self.estado = Estado.IDLE
+        self.t_chao_ini = None
+        self.tipo_queda = None
         self.t_queda = None
         self.t_erguido = None
         self.movs = []
@@ -475,6 +552,25 @@ def trava_camera(dev, travar):
         print("[câmera] exposição/cor/foco de volta ao automático")
 
 
+def exposicao_manual(dev, valor):
+    """Fixa exposição e balanço de branco: a câmera deixa de reajustar o
+    brilho quando alguém entra em cena (na Brio, o chão vazio clareava ~40%
+    e a máscara ficava toda branca)."""
+    existentes = _controles_existentes(dev)
+    if not existentes:
+        print("[câmera] v4l2-ctl indisponível: exposição continua automática")
+        return
+    feitos = []
+    for nome, v in (("auto_exposure", 1), ("exposure_auto", 1),
+                    ("exposure_time_absolute", valor), ("exposure_absolute", valor),
+                    ("exposure_dynamic_framerate", 0), ("exposure_auto_priority", 0),
+                    ("white_balance_automatic", 0), ("white_balance_temperature_auto", 0)):
+        if nome in existentes:
+            _v4l2(dev, f"--set-ctrl={nome}={v}")
+            feitos.append(f"{nome}={v}")
+    print("[câmera] exposição MANUAL:", ", ".join(feitos))
+
+
 def abre_camera(args):
     if args.video:
         return cv2.VideoCapture(args.video)
@@ -496,11 +592,15 @@ def abre_camera(args):
 
 # --------------------------------- Programa ---------------------------------
 def main():
-    global TEMPO_CRITICO_S, COOLDOWN_ALERTA_S
+    global TEMPO_CRITICO_S, COOLDOWN_ALERTA_S, QUEDA_LENTA_S
     ap = argparse.ArgumentParser()
     ap.add_argument("--camera", type=int, default=0)
     ap.add_argument("--video", default=None, help="(opcional) arquivo de vídeo")
     ap.add_argument("--teste", action="store_true", help="tempo crítico de 5 s")
+    ap.add_argument("--exposicao", type=int, default=None, metavar="N",
+                    help="exposição MANUAL fixa (v4l2 exposure_time_absolute, "
+                         "em unidades de 100 us; ex.: 150 = 15 ms). Desliga a "
+                         "exposição e o balanço de branco automáticos.")
     ap.add_argument("--travar", action="store_true",
                     help="(experimental) trava exposição/cor/foco via v4l2-ctl. "
                          "Na LifeCam deixou a imagem estourada e desfocada.")
@@ -511,6 +611,7 @@ def main():
     args = ap.parse_args()
     if args.teste:
         TEMPO_CRITICO_S = 5.0
+        QUEDA_LENTA_S = 8.0          # no teste, queda lenta após 8 s no chão
         COOLDOWN_ALERTA_S = 20.0     # no teste, alertas seguidos não ficam bloqueados 5 min
         print("[MODO TESTE] tempo crítico = 5 s")
 
@@ -527,7 +628,7 @@ def main():
         print("(Ctrl+C neste terminal para encerrar)")
 
     def on_evento(tipo, info):
-        print(f"[EVENTO] {tipo.upper()} | transição {info['transicao_s']} s | "
+        print(f"[EVENTO] {tipo.upper()} ({info['tipo']}) | transição {info['transicao_s']} s | "
               f"{info['tempo_no_chao_s']} s no chão | "
               f"{'IMÓVEL' if info['imovel'] else 'movendo-se'} "
               f"(mov={info['movimento']})")
@@ -537,7 +638,7 @@ def main():
             print(f"[EVENTO] foto salva em {foto}")
     on_evento.quadro = None
 
-    sil = Silhueta()
+    sil = Silhueta(compensar=args.exposicao is None)
     fsm = FSM(on_evento)
     print("Deixe a cena VAZIA por 6 s (câmera se ajusta e o fundo é aprendido)...")
 
@@ -568,7 +669,10 @@ def laco(cap, sil, fsm, on_evento, web, fps_video, args):
         # SEMPRE devolve a câmera ao automático ao iniciar: as configurações
         # do v4l2 ficam gravadas na câmera enquanto ela estiver ligada, e uma
         # execução anterior pode tê-la deixado travada em valores ruins.
-        trava_camera(dev, False)
+        if args.exposicao is not None:
+            exposicao_manual(dev, args.exposicao)
+        else:
+            trava_camera(dev, False)
     while True:
         ok, quadro = cap.read()
         if not ok:
@@ -586,9 +690,11 @@ def laco(cap, sil, fsm, on_evento, web, fps_video, args):
                 cap = abre_camera(args)
                 t_aprender = None    # fundo precisa ser reaprendido
                 sil.reinicia()
-                if dev:
+                if dev and args.exposicao is None:
                     trava_camera(dev, False)
                     travada = False
+                elif dev:
+                    exposicao_manual(dev, args.exposicao)
             continue
         if falhas >= 30:
             print("[câmera] reconectada. Deixe a cena VAZIA por 6 s...")
@@ -693,7 +799,7 @@ def laco(cap, sil, fsm, on_evento, web, fps_video, args):
             sil.reinicia()
             fsm = FSM(on_evento)
             t_aprender = None
-            if dev:   # destrava, deixa reajustar no aquecimento e trava de novo
+            if dev and args.exposicao is None:   # destrava e deixa reajustar
                 trava_camera(dev, False)
                 travada = False
             print("Reaprendendo o fundo: deixe a cena VAZIA por 6 s...")
